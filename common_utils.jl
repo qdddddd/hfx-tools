@@ -45,8 +45,15 @@ function read_input_df(date, args)
 end
 ##
 
+_get_intraday_time(dt::Vector{DateTime}) = Time.(ifelse.(hour.(dt) .> 12, dt .- Minute(90), dt) .- Hour(9) .- Minute(30))
+
 function preprocess_raw!(df, symbol)
-    @rtransform!(df, :Timestamp = unix2datetime_adj(:Timestamp))
-    @rtransform!(df, :IntradayTime = Time((hour(:Timestamp) > 12 ? :Timestamp - Minute(90) : :Timestamp) - Hour(9) - Minute(30)))
+    df[!, :Timestamp] = unix2datetime_adj.(df.Timestamp)
+    df[!, :IntradayTime] = _get_intraday_time(df.Timestamp)
     insertcols!(df, 3, :Code => symbol, :Date => Date.(df.Timestamp))
+end
+
+function get_intraday_time!(args, df)
+    dt = unix2datetime_adj.(df.Timestamp)
+    args.dt_cols = DataFrame(:Date => dt, :IntradayTime => _get_intraday_time(dt))
 end

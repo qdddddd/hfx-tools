@@ -13,7 +13,7 @@ function _corr_downsample(args::ProcessArgs, hfx::Matrix; return_corr::Bool=fals
     while ind <= size(hfx, 1)
         cur = ind + 1
         while cur <= size(hfx, 1)
-            corr = @views cor(hfx[ind, :], hfx[cur, :])
+            corr = cor((@view hfx[ind, :]), (@view hfx[cur, :]))
 
             if ismissing(corr) || corr >= args.corr_thres
                 cur += 1
@@ -97,11 +97,8 @@ function _corr_downsample_rev(args::ProcessArgs, hfx::Matrix; return_corr::Bool=
 end
 
 function corr_downsample(args::ProcessArgs)
-    if args.time_thres != 0
-        args.time_diff = vcat([0], diff(args.df_raw."Timestamp" / 1e6))
-    end
-
     hfx = Matrix(args.df_raw[!, args.hfx_cols])
+    get_intraday_time!(args, args.df_raw)
     subset_ind, _ = _corr_downsample(args, hfx)
 
     if subset_ind === nothing
@@ -114,29 +111,24 @@ function corr_downsample(args::ProcessArgs)
 end
 
 function corr_downsample_cont(args::ProcessArgs)
-    if args.time_thres != 0
-        args.time_diff = vcat([0], diff(args.df_raw."Timestamp" / 1e6))
-    end
-
-    symbol = args.task.symbol
-    date = args.dates[args.task.dtid]
-
     input_df = nothing
     last_selected_df = nothing
 
-    insertcols!(args.df_raw, 3, :Code => symbol, :Date => date)
+    insertcols!(args.df_raw, 3, :Code => args.task.symbol, :Date => args.dates[args.task.dtid])
 
     if isempty(args.out_q) && args.task.dtid > 1
         prev_ofile = get_out_file(args, args.dates[args.task.dtid-1])
+
         if isfile(prev_ofile)
             last_selected_df = CSV.File(prev_ofile, ntasks=1) |> DataFrame
         end
-    else
+    elseif !isempty(args.out_q)
         last_selected_df = pop!(args.out_q)
     end
 
-    input_df = isnothing(last_selected_df) ? args.df_raw : vcat(last_selected_df[end:end, :], args.df_raw)
+    input_df = isnothing(last_selected_df) ? args.df_raw : vcat(last_selected_df[end:end, Not(:Index1000Price)], args.df_raw)
     hfx = Matrix(input_df[!, args.hfx_cols])
+    get_intraday_time!(args, input_df)
     subset_ind, _ = _corr_downsample(args, hfx)
 
     if !isnothing(last_selected_df)
@@ -155,6 +147,22 @@ function corr_downsample_cont(args::ProcessArgs)
 
     df_subset = input_df[subset_ind, :]
     args.df_raw = nothing
+
+    if isempty(df_subset)
+        return nothing
+    end
+
+    # Add index prices
+    stid = findfirst(x -> x >= df_subset.Timestamp[1], args.index_df.ExTime)
+    stid = max(1, stid - 1)
+    edid = findlast(x -> x <= df_subset.Timestamp[end], args.index_df.ExTime)
+    if isnothing(edid)
+        df_subset[!, :Index1000Price] .= missing
+    else
+        sub = @view args.index_df[stid:edid, :]
+        df_subset[!, :Index1000Price] = interpolate(sub, df_subset.Timestamp, :LastPrice, :ExTime)
+    end
+
     return df_subset
 end
 

@@ -17,7 +17,7 @@ const PROCESSING = 0x1
 const COMPLETED = 0x2
 
 ##
-function process(args::ProcessArgs, file_lock::LockedDict{String, ReentrantLock})
+function process(args::ProcessArgs, file_lock::LockedDict{String,ReentrantLock})
     date = args.dates[args.task.dtid]
     ofile = get_out_file(args, date)
 
@@ -39,7 +39,7 @@ function process(args::ProcessArgs, file_lock::LockedDict{String, ReentrantLock}
     end
 
     # Round data (assuming numerical)
-    df_out = round_df!(df_out, digits=3)
+    round_df!(df_out, digits=3, exclude=["Index1000Price"])
 
     # Handle dry run
     if args.dry_run
@@ -269,6 +269,26 @@ function main()
         roll_win=50,
         n_steps=20,
     )
+
+    if func == corr_downsample_cont
+        # Get index prices
+        index_df = DataFrame()
+        lk = ReentrantLock()
+        @showprogress desc = "Loading index prices" showspeed = true barlen = 60 @threads for dt in dates
+            df = get_index("1000", dt, unix=true)
+            if !isnothing(df)
+                df[!, :LastPrice] = round.(df.LastPrice, digits=4)
+                lock(lk) do
+                    append!(index_df, df, promote=true)
+                end
+            end
+        end
+
+        sort!(index_df, :ExTime)
+        index_df[!, :ExTime] .*= 1000
+        GARGS.index_df = index_df
+    end
+
     term_signal = "#"
     ##
 
