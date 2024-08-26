@@ -20,7 +20,7 @@ function get_out_file(args, dt)
     end
 end
 
-unix2datetime_adj(x) = unix2datetime(x / 1e6) + Hour(8)
+unix2datetime_adj(x) = eltype(x) <: Int ? unix2datetime(x / 1e6) + Hour(8) : x
 
 ##
 function read_input_df(date, args)
@@ -32,12 +32,17 @@ function read_input_df(date, args)
             joinpath(args.hdf_root, date, "$(args.task.symbol)_$(date).hdf"),
             feature_names=args.hdf_features, label_names=args.hdf_labels, insert_ts=false
         )
-        select!(X, [:AppSeq, :CumAmount, :CumVolume, :CumBuyTurnover, :CumSellTurnover])
-        select!(Y, [:AppSeq, :FirstBidPrice, :FirstAskPrice])
-        unique!(X, :AppSeq)
-        unique!(Y, :AppSeq)
-        leftjoin!(df_raw, X, on=:AppSeq)
-        leftjoin!(df_raw, Y, on=:AppSeq)
+        if !isnothing(X)
+            select!(X, [:AppSeq, :CumAmount, :CumVolume, :CumBuyTurnover, :CumSellTurnover])
+            unique!(X, :AppSeq)
+            leftjoin!(df_raw, X, on=:AppSeq)
+        end
+
+        if !isnothing(Y)
+            select!(Y, [:AppSeq, :FirstBidPrice, :FirstAskPrice])
+            unique!(Y, :AppSeq)
+            leftjoin!(df_raw, Y, on=:AppSeq)
+        end
         dropmissing!(df_raw)
     end
 
@@ -55,5 +60,5 @@ end
 
 function get_intraday_time!(args, df)
     dt = unix2datetime_adj.(df.Timestamp)
-    args.dt_cols = DataFrame(:Date => dt, :IntradayTime => _get_intraday_time(dt))
+    args.dt_cols = DataFrame(:Date => Date.(dt), :IntradayTime => _get_intraday_time(dt))
 end

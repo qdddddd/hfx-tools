@@ -2,10 +2,9 @@ using Pkg
 Pkg.precompile()
 
 using Base: Semaphore, acquire
-using .Threads, CSV, ProgressMeter, Printf, Glob, DataFrames, DataStructures, Dates, GZip, Logging, JSON
+using .Threads, CSV, ProgressMeter, Printf, Glob, DataFrames, DataStructures, Dates, GZip, Logging, JSON, StatsBase
 using DfUtils, DfUtils
 
-# ENV["JULIA_DEBUG"] = "Main"
 @info "Using $(nthreads()) threads"
 
 include("structs.jl")
@@ -60,16 +59,30 @@ function process(args::ProcessArgs, file_lock::LockedDict{String,ReentrantLock})
             end
         end
     else
-        out_dir = dirname(ofile)
-        if !isdir(out_dir)
-            mkpath(out_dir)
-        end
+        if args.func == corr_label
+            df_out[!, :Date] = Dates.format.(Date.(df_out.Timestamp), dateformat"yyyymmdd")
+            for g in groupby(df_out, :Date)
+                fn = get_out_file(args, g.Date[1])
 
-        if isfile(ofile)
-            rm(ofile)
-        end
+                out_dir = dirname(fn)
+                if !isdir(out_dir)
+                    mkpath(out_dir)
+                end
 
-        CSV.write(ofile, df_out, compress=args.compress)
+                CSV.write(fn, g[!, 1:end-1], compress=args.compress, append=isfile(fn))
+            end
+        else
+            if isfile(ofile)
+                rm(ofile)
+            end
+
+            out_dir = dirname(ofile)
+            if !isdir(out_dir)
+                mkpath(out_dir)
+            end
+
+            CSV.write(ofile, df_out, compress=args.compress)
+        end
     end
 
     if !isempty(q_out)
@@ -100,8 +113,10 @@ function main()
     stock_info = nothing
     output_root = nothing
     func = corr_downsample
+    cor_func = StatsBase.cor
     compress = true
     corr_thres = nothing
+    y_corr_thres = nothing
     dry_run = false
     skip_existing = false
     clear = false
@@ -113,6 +128,8 @@ function main()
         arg = ARGS[i]
         if arg == "--corr"
             corr_thres = parse(Float32, ARGS[i+1])
+        elseif arg == "--y-corr"
+            y_corr_thres = parse(Float32, ARGS[i+1])
         elseif arg == "-s"
             start_dt = ARGS[i+1]
         elseif arg == "-e"
@@ -138,12 +155,10 @@ function main()
             schema = JSON.parsefile(joinpath(hdf_root, "description.json"))
             hdf_features = Symbol.(schema["FeatureNames"])
             hdf_labels = Symbol.(schema["LabelNames"])
-            stock_info = CSV.read(
-                "/ivohf/hrmspro/prediction/InfinityRound2/stock_info.csv", DataFrame;
-                types=Dict(:Code => String, :Date => Date), dateformat="yyyymmdd"
-            )
         elseif arg == "--func"
             func = getfield(Main, Symbol(ARGS[i+1]))
+        elseif arg == "--cor-func"
+            cor_func = getfield(StatsBase, Symbol(ARGS[i+1]))
         elseif arg == "--dry"
             dry_run = true
         elseif arg == "--clear"
@@ -165,15 +180,27 @@ function main()
     raw_predict_dir = joinpath(d, hfx_model_name)
 
     if isnothing(output_root) && !isnothing(corr_thres)
-        postfix = endswith(string(nameof(func)), "cont") ? "Cont" : ""
-        postfix = endswith(string(nameof(func)), "rev") ? "Rev" : postfix
-        output_root = "$(raw_predict_dir)(CorrSelected$(postfix)$(@sprintf("%.2f", corr_thres))$(shift > 0 ? "_$(shift)" : "")$(time_thres > 0 ? "_$(time_thres)s" : ""))"
+        postfix = func == corr_downsample_cont ? "Cont" : ""
+        postfix = occursin("_rev", string(nameof(func))) ? "Rev" : postfix
+
+        func_name = "Corr"
+        if cor_func == StatsBase.corkendall
+            func_name = "Kendall"
+        end
+
+        output_root = "$(raw_predict_dir)($(func_name)Selected$(postfix)$(@sprintf("%.2f", corr_thres))$(shift > 0 ? "_$(shift)" : "")$(time_thres > 0 ? "_$(time_thres)s" : ""))"
+
+        if !isnothing(y_corr_thres)
+            output_root = output_root[1:end-1] * "_YC$(y_corr_thres))"
+        end
+
         if !isnothing(snapshot_time)
             output_root = joinpath(output_root, snapshot_time)
         end
     end
 
-    ##
+    ## Process existing files
+    dict_existing_end = nothing
 
     if isdir(output_root)
         if clear
@@ -186,6 +213,7 @@ function main()
             @showprogress desc = "Scanning existing files" showspeed = true barlen = 60 @threads for file in readdir(output_root)
                 lines = eachline(GZip.open(joinpath(output_root, file)))
                 header = first(lines)
+                header *= ",Symbol"
                 line = nothing
                 for l in lines
                     line = l
@@ -195,6 +223,7 @@ function main()
                     continue
                 end
 
+                line *= ",$(file[1:9])"
                 line = header * "\n" * line * "\n"
 
                 lock(lk) do
@@ -202,17 +231,18 @@ function main()
                 end
             end
 
-            fmt = "yyyymmdd"
-            max_date = maximum(DataFrame(CSV.File(
-                map(IOBuffer, existing_dt); select=["Date"], types=Dict(:Date => Date), dateformat=fmt
-            )).Date)
-            start_dt = Dates.format(max_date + Dates.Day(1), fmt)
+            df = DataFrame(CSV.File(map(IOBuffer, existing_dt); select=["Symbol", "Timestamp"]))
+            if eltype(df.Timestamp) <: Int
+                df[!, :Timestamp] = unix2datetime_adj.(df.Timestamp)
+            end
+
+            dict_existing_end = Dict(zip(df.Symbol, df.Timestamp))
         end
     else
         mkpath(output_root)
     end
 
-    ## Generate GARGS
+    ##
     # Get list of dates
     dates = readdir(raw_predict_dir)
     filter!(x -> occursin(r"^\d{8}$", x), dates)
@@ -229,6 +259,11 @@ function main()
         ed_id = findlast(x -> x <= end_dt, dates)
     end
 
+    if isnothing(st_id) || isnothing(ed_id)
+        @info "No date to process."
+        return
+    end
+
     @info "Params" date = "$(dates[st_id]) - $(dates[ed_id])" input_dir = raw_predict_dir output_dir = output_root one_file hdf_root dry_run clear skip_existing
 
     codes = select_df(
@@ -240,8 +275,29 @@ function main()
         "
     ).Code
 
-    file_lock = LockedDict{String,ReentrantLock}()
+    if func == corr_label
+        hdf_features = nothing
+        stock_info = Dict()
+        selected_root = "$(raw_predict_dir)(CorrSelectedCont$(@sprintf("%.2f", corr_thres))$(shift > 0 ? "_$(shift)" : "")$(time_thres > 0 ? "_$(time_thres)s" : ""))"
+        lk = ReentrantLock()
+        @showprogress desc = "Loading downsampled timestamps" showspeed = true barlen = 60 for file in readdir(selected_root)
+            df = CSV.read(joinpath(selected_root, file), DataFrame; select=[:AppSeq, :Timestamp])
+            df[!, :Timestamp] = unix2datetime_adj.(df.Timestamp)
+            if !isnothing(dict_existing_end)
+                @rsubset!(df, :Timestamp > dict_existing_end[file[1:9]])
+            end
+            lock(lk) do
+                stock_info[file[1:9]] = df
+            end
+        end
+    elseif func in [corr_downsample_rev, corr_downsample_rev_no_roll]
+        stock_info = CSV.read(
+            "/ivohf/hrmspro/prediction/InfinityRound2/stock_info.csv", DataFrame;
+            types=Dict(:Code => String, :Date => Date), dateformat="yyyymmdd"
+        )
+    end
 
+    ## Generate GARGS
     GARGS = ProcessArgs(
         task_dict=Dict{String,LockedDeque{ProcessTask}}([c => LockedDeque{ProcessTask}() for c in codes]),
         out_store=Dict{String,Deque{DataFrame}}([c => Deque{DataFrame}() for c in codes]),
@@ -249,14 +305,17 @@ function main()
         dfs_buffer_sizes=Dict{String,Queue{Int}}([c => Queue{Int}() for c in codes]),
         stock_info=stock_info,
         dates=dates,
+        in_root=raw_predict_dir,
         out_root=output_root,
         corr_thres=corr_thres,
+        y_corr_thres=y_corr_thres,
         time_thres=Second(time_thres),
         shift=shift,
         hdf_root=hdf_root,
         hdf_features=hdf_features,
         hdf_labels=hdf_labels,
         func=func,
+        cor_func=cor_func,
         compress=compress,
         dry_run=dry_run,
         skip_existing=skip_existing,
@@ -301,11 +360,29 @@ function main()
 
         for i in st_id:ed_id
             date = dates[i]
+            dt = Date(date, dateformat"yyyymmdd")
             files = glob("*.csv*", joinpath(raw_predict_dir, date))
-            count = 0
+            n_tasks = 0
 
             for file in files
                 _, symbol = get_date_symbol(file)
+
+                if one_file && !isnothing(dict_existing_end)
+                    if (
+                        haskey(dict_existing_end, symbol)
+                        &&
+                        (
+                            (func == corr_label && dt < Date(dict_existing_end[symbol]))
+                            ||
+                            (func != corr_label && dt <= dict_existing_end[symbol])
+                        )
+                    )
+                        continue
+                    end
+                end
+
+                println(file)
+
                 new_task = ProcessTask(i, symbol, raw_predict_dir, UNPROCESSED)
 
                 if !(symbol in valid_symbols)
@@ -315,10 +392,10 @@ function main()
 
                 q = GARGS.task_dict[symbol]
                 push!(q, new_task)
-                count += 1
+                n_tasks += 1
             end
 
-            atomic_add!(total_files, count)
+            atomic_add!(total_files, n_tasks)
             pbar.n = total_files[]
             yield()
         end
@@ -341,6 +418,7 @@ function main()
     sem = Semaphore(nthreads())
     force_quit = Atomic{Bool}(false)
     n_symbols_terminated = Atomic{Int}(0)
+    file_lock = LockedDict{String,ReentrantLock}()
 
     while n_symbols_terminated[] < n_symbols_started[] || !istaskdone(supplier)
         for symbol in keys(GARGS.task_dict)
