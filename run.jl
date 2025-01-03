@@ -1,9 +1,10 @@
 using Pkg
+Pkg.resolve()
 Pkg.precompile()
 
-using Base: Semaphore, acquire
-using .Threads, CSV, ProgressMeter, Printf, Glob, DataFrames, DataStructures, Dates, GZip, Logging, JSON, StatsBase
-using DfUtils, DfUtils
+using Base: Semaphore, acquire, release, Filesystem
+using .Threads, Logging, CSV, ProgressMeter, Printf, Glob, DataFrames, DataStructures, Dates, GZip, JSON, StatsBase
+using DbUtils, DfUtils
 
 @info "Using $(nthreads()) threads"
 
@@ -16,7 +17,7 @@ const PROCESSING = 0x1
 const COMPLETED = 0x2
 
 ##
-function process(args::ProcessArgs, file_lock::LockedDict{String,ReentrantLock})
+function process(args::ProcessArgs, file_lock::LockedDict{String,ReentrantLock}, out_store::Dict{String,Deque{DataFrame}})
     date = args.dates[args.task.dtid]
     ofile = get_out_file(args, date)
 
@@ -25,12 +26,18 @@ function process(args::ProcessArgs, file_lock::LockedDict{String,ReentrantLock})
         return
     end
 
-    q_out = args.out_store[args.task.symbol]
+    q_out = out_store[args.task.symbol]
     df_raw = read_input_df(date, args)
+
+    if !isnothing(args.start_time)
+        @rsubset!(df_raw, Time(unix2datetime_adj(:Timestamp)) >= args.start_time)
+    end
 
     # Call user-defined function
     args = ProcessArgs(args; df_raw=df_raw, date=date, out_q=q_out, hfx_cols=r"HFX\d+")
+    @debug "Processing $(args.task.symbol)@$(date)"
     df_out = args.func(args)
+    @debug "Processed $(args.task.symbol)@$(date)"
 
     # Check if function returned None
     if df_out === nothing || isempty(df_out)
@@ -46,6 +53,7 @@ function process(args::ProcessArgs, file_lock::LockedDict{String,ReentrantLock})
     end
 
     # Store output
+    @debug "Writing $(args.task.symbol)@$(date)"
     if args.one_file
         if isnothing(args.snapshot_time)
             CSV.write(ofile, df_out, compress=args.compress, append=isfile(ofile))
@@ -84,6 +92,7 @@ function process(args::ProcessArgs, file_lock::LockedDict{String,ReentrantLock})
             CSV.write(ofile, df_out, compress=args.compress)
         end
     end
+    @debug "Written $(args.task.symbol)@$(date)"
 
     if !isempty(q_out)
         if endswith(string(nameof(args.func)), "cont")
@@ -112,6 +121,7 @@ function main()
     hdf_labels = nothing
     stock_info = nothing
     output_root = nothing
+    output_root_tmp = Filesystem.mktempdir()
     func = corr_downsample
     cor_func = StatsBase.cor
     compress = true
@@ -122,6 +132,7 @@ function main()
     clear = false
     one_file = false
     snapshot_time = nothing
+    start_time = nothing
     ##
 
     for i in eachindex(ARGS)
@@ -144,6 +155,8 @@ function main()
             snapshot_time = ARGS[i+1]
         elseif arg == "--tt"
             time_thres = parse(Int, ARGS[i+1])
+        elseif arg == "--start"
+            start_time = ARGS[i+1]
         elseif arg == "--no-compress"
             compress = false
         elseif arg == "--skip-existing"
@@ -165,6 +178,8 @@ function main()
             clear = true
         elseif arg == "--one-file"
             one_file = true
+        elseif arg == "--debug"
+            ENV["JULIA_DEBUG"] = Main
         end
     end
 
@@ -192,6 +207,10 @@ function main()
 
         if !isnothing(y_corr_thres)
             output_root = output_root[1:end-1] * "_YC$(y_corr_thres))"
+        end
+
+        if !isnothing(start_time)
+            output_root = output_root[1:end-1] * "_st$(start_time))"
         end
 
         if !isnothing(snapshot_time)
@@ -264,14 +283,15 @@ function main()
         return
     end
 
-    @info "Params" date = "$(dates[st_id]) - $(dates[ed_id])" input_dir = raw_predict_dir output_dir = output_root one_file hdf_root dry_run clear skip_existing
+    @info "Params" date = "$(dates[st_id]) - $(dates[ed_id])" input_dir = raw_predict_dir output_root output_root_tmp one_file hdf_root dry_run clear skip_existing
 
-    codes = select_df(
-        ClickHouseClient(),
+    codes = query_df(
+        gcli(),
         "
             SELECT DISTINCT S_INFO_WINDCODE Code
             FROM winddb_mirror.ashareeodprices
             WHERE TRADE_DT >= '$(dates[st_id])' AND TRADE_DT <= '$(dates[ed_id])'
+                AND right(S_INFO_WINDCODE, 2) IN ('SH', 'SZ')
         "
     ).Code
 
@@ -299,14 +319,13 @@ function main()
 
     ## Generate GARGS
     GARGS = ProcessArgs(
-        task_dict=Dict{String,LockedDeque{ProcessTask}}([c => LockedDeque{ProcessTask}() for c in codes]),
-        out_store=Dict{String,Deque{DataFrame}}([c => Deque{DataFrame}() for c in codes]),
         dfs_buffer=Dict{String,DataFrame}([c => DataFrame() for c in codes]),
         dfs_buffer_sizes=Dict{String,Queue{Int}}([c => Queue{Int}() for c in codes]),
         stock_info=stock_info,
         dates=dates,
         in_root=raw_predict_dir,
         out_root=output_root,
+        out_root_tmp=output_root_tmp,
         corr_thres=corr_thres,
         y_corr_thres=y_corr_thres,
         time_thres=Second(time_thres),
@@ -327,6 +346,8 @@ function main()
         ),
         roll_win=50,
         n_steps=20,
+        start_time=isnothing(start_time) ? nothing : Time(parse(Int, start_time[1:2]), parse(Int, start_time[3:4]), 0),
+        use_tmp=!(one_file && skip_existing),
     )
 
     if func == corr_downsample_cont
@@ -336,9 +357,8 @@ function main()
         @showprogress desc = "Loading index prices" showspeed = true barlen = 60 @threads for dt in dates
             df = get_index("1000", dt, unix=true)
             if !isnothing(df)
-                df[!, :LastPrice] = round.(df.LastPrice, digits=4)
                 lock(lk) do
-                    append!(index_df, df, promote=true)
+                    append!(index_df, df, promote=true, cols=:union)
                 end
             end
         end
@@ -351,6 +371,7 @@ function main()
     term_signal = "#"
     ##
 
+    task_dict = Dict{String,Channel{ProcessTask}}([c => Channel{ProcessTask}(ed_id - st_id + 1) for c in codes])
     total_files = Atomic{Int}(0)
     pbar = Progress(total_files[]; desc="$(nameof(func)):", showspeed=true, barlen=60)
 
@@ -368,20 +389,10 @@ function main()
                 _, symbol = get_date_symbol(file)
 
                 if one_file && !isnothing(dict_existing_end)
-                    if (
-                        haskey(dict_existing_end, symbol)
-                        &&
-                        (
-                            (func == corr_label && dt < Date(dict_existing_end[symbol]))
-                            ||
-                            (func != corr_label && dt <= dict_existing_end[symbol])
-                        )
-                    )
+                    if haskey(dict_existing_end, symbol) && dt <= Date(dict_existing_end[symbol])
                         continue
                     end
                 end
-
-                println(file)
 
                 new_task = ProcessTask(i, symbol, raw_predict_dir, UNPROCESSED)
 
@@ -390,18 +401,17 @@ function main()
                     push!(valid_symbols, symbol)
                 end
 
-                q = GARGS.task_dict[symbol]
-                push!(q, new_task)
+                q = task_dict[symbol]
+                put!(q, new_task)
                 n_tasks += 1
             end
 
             atomic_add!(total_files, n_tasks)
             pbar.n = total_files[]
-            yield()
         end
 
         for symbol in valid_symbols
-            push!(GARGS.task_dict[symbol], ProcessTask(term_signal, COMPLETED))
+            put!(task_dict[symbol], ProcessTask(term_signal, COMPLETED))
         end
     end
 
@@ -415,62 +425,92 @@ function main()
     end
 
     @info "Start processing tasks..."
-    sem = Semaphore(nthreads())
+    sem = Semaphore(nthreads() - 2)
     force_quit = Atomic{Bool}(false)
-    n_symbols_terminated = Atomic{Int}(0)
+    n_symbols_terminated = 0
     file_lock = LockedDict{String,ReentrantLock}()
+    out_store = Dict{String,Deque{DataFrame}}([c => Deque{DataFrame}() for c in codes])
 
-    while n_symbols_terminated[] < n_symbols_started[] || !istaskdone(supplier)
-        for symbol in keys(GARGS.task_dict)
+    while n_symbols_terminated < n_symbols_started[] || !istaskdone(supplier)
+        n_start = 0
+        n_finish = 0
+        n_process = 0
+        n_empty = 0
+        to_delete = String[]
+
+        for symbol in keys(task_dict)
             if force_quit[]
                 return
             end
 
-            task_q = GARGS.task_dict[symbol]
+            task_q = task_dict[symbol]
 
-            if isempty(task_q)
+            if !isready(task_q)
+                @debug "Empty queue for $(symbol)"
+                n_empty += 1
+
+                if istaskdone(supplier)
+                    push!(to_delete, symbol)
+                end
                 continue
             end
 
-            task = first(task_q)
+            task = fetch(task_q)
 
             if task.symbol == term_signal
-                empty!(GARGS.task_dict[symbol])
+                take!(task_dict[symbol])
+                @assert !isready(task_dict[symbol])
                 empty!(GARGS.dfs_buffer[symbol])
-                empty!(GARGS.out_store[symbol])
-                atomic_add!(n_symbols_terminated, 1)
+                empty!(out_store[symbol])
+                n_symbols_terminated += 1
                 continue
             end
 
             if task.status[] == PROCESSING
+                @debug "Skipping $(task.symbol)@$(dates[task.dtid])"
+                n_process += 1
                 continue
             end
 
             if task.status[] == COMPLETED
-                popfirst!(task_q)
+                @debug "Completing $(task.symbol)@$(dates[task.dtid])"
+                take!(task_q)
+                # size_q = GARGS.dfs_buffer_sizes[task.symbol]
+                # s = isempty(size_q) ? 0 : maximum(size_q)
                 next!(pbar,
                     showvalues=[
                         (:Progress, "$(pbar.counter+1)/$(pbar.n)"),
-                        (:NSymbols, "$(n_symbols_terminated[])/$(n_symbols_started[])")
+                        (:NSymbols, "$(n_symbols_terminated)/$(n_symbols_started[])"),
+                        # (:ScanSize, "$(s)")
+                        (:Counts, "st = $(n_start) | pr = $(n_process) | ed = $(n_finish) | na = $(n_empty)")
                     ]
                 )
+                n_finish += 1
                 continue
             end
 
             atomic_xchg!(task.status, PROCESSING)
 
             @spawn begin
+                @debug "Aquiring $(task.symbol)@$(dates[task.dtid])"
                 acquire(sem) do
                     try
-                        process(ProcessArgs(GARGS; task=task), file_lock)
+                        process(ProcessArgs(GARGS; task=task), file_lock, out_store)
+                        atomic_xchg!(task.status, COMPLETED)
+                        # @debug "Completed $(task.symbol)@$(dates[task.dtid])"
                     catch e
                         @error "\nException thrown with $(task.symbol)@$(dates[task.dtid])" exception = (e, catch_backtrace())
                         atomic_xchg!(force_quit, true)
                     end
-
-                    atomic_xchg!(task.status, COMPLETED)
                 end
+                @debug "Released $(task.symbol)@$(dates[task.dtid])"
             end
+            n_start += 1
+        end
+
+        @debug "Deleting $(length(to_delete)) keys"
+        for symbol in to_delete
+            delete!(task_dict, symbol)
         end
 
         yield()
@@ -478,6 +518,12 @@ function main()
 
     wait(supplier)
     finish!(pbar)
+
+    if GARGS.use_tmp
+        @showprogress desc = "Moving tmp to dest" showspeed = true barlen = 60 @threads for dir in readdir(output_root_tmp)
+            mv(joinpath(output_root_tmp, dir), joinpath(output_root, dir); force=true)
+        end
+    end
 end
 
 main()

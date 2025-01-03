@@ -160,7 +160,7 @@ function corr_downsample_cont(args::ProcessArgs)
 
     # Add index prices
     stid = findfirst(x -> x >= df_subset.Timestamp[1], args.index_df.ExTime)
-    stid = max(1, stid - 1)
+    stid = isnothing(stid) ? 1 : max(1, stid - 1)
     edid = findlast(x -> x <= df_subset.Timestamp[end], args.index_df.ExTime)
     if isnothing(edid)
         df_subset[!, :Index1000Price] .= missing
@@ -399,24 +399,31 @@ function corr_label(args::ProcessArgs)
     end
 
     ##
-    for _ in 1:size(df_buffer, 1)
+    for n in 1:size(df_buffer, 1)
         if (@view df_buffer[1, [:AppSeq, :Timestamp]]) != (@view df_selected[1, :])
             deleteat!(df_buffer, 1)
             deleteat!(args.dt_cols, 1)
             continue
         end
 
-        hfx = Matrix(df_buffer[!, args.hfx_cols])
+        df_input = n > 1 ? df_buffer : vcat((@view df_buffer[1:1, :]), args.df_raw)
+        hfx = Matrix(df_input[!, args.hfx_cols])
         subset_ind, _ = _corr_downsample(args, hfx; steps=1, corr_thres=args.y_corr_thres)
 
         if isnothing(subset_ind) || length(subset_ind) == 1
             break
         end
 
-        x = @view df_buffer[subset_ind[1], :]
-        y = @view df_buffer[subset_ind[2], :]
+        size_q = args.dfs_buffer_sizes[args.task.symbol]
+        enqueue!(size_q, subset_ind[2])
+        while length(size_q) >= 20
+            dequeue!(size_q)
+        end
+
+        x = @view df_input[subset_ind[1], :]
+        y = @view df_input[subset_ind[2], :]
         row = hcat(
-            df_selected[1, :] |> DataFrame,
+            x[[:AppSeq, :Timestamp]] |> DataFrame,
             rename!(
                 y[[:AppSeq, :Timestamp]] |> DataFrame,
                 :AppSeq => Symbol("AppSeq01_C$(args.y_corr_thres)"),

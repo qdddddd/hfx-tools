@@ -9,14 +9,15 @@ end
 get_in_file(args, dt) = joinpath(args.task.idir, dt, "$(args.task.symbol)_$(dt).csv.gz")
 
 function get_out_file(args, dt)
+    out_root = args.use_tmp ? args.out_root_tmp : args.out_root
     if args.one_file
         if isnothing(args.snapshot_time)
-            return joinpath(args.out_root, "$(args.task.symbol).csv$(args.compress ? ".gz" : "")")
+            return joinpath(out_root, "$(args.task.symbol).csv$(args.compress ? ".gz" : "")")
         else
-            return joinpath(args.out_root, "$(dt).csv$(args.compress ? ".gz" : "")")
+            return joinpath(out_root, "$(dt).csv$(args.compress ? ".gz" : "")")
         end
     else
-        return joinpath(args.out_root, dt, "$(args.task.symbol)_$(dt).csv$(args.compress ? ".gz" : "")")
+        return joinpath(out_root, dt, "$(args.task.symbol)_$(dt).csv$(args.compress ? ".gz" : "")")
     end
 end
 
