@@ -1,10 +1,12 @@
-using DfUtils, DbUtils, DataFramesMeta
+using JlUtils
+using .DfUtils, .DbUtils
 
 function _corr_downsample(args::ProcessArgs, hfx::AbstractMatrix; steps=-1, return_corr::Bool=false, corr_thres=NaN)
     if isnan(corr_thres)
         corr_thres = args.corr_thres
     end
 
+    hfx = coalesce.(hfx, NaN)
     ind = args.shift + 1
 
     if ind >= size(hfx, 1)
@@ -19,7 +21,7 @@ function _corr_downsample(args::ProcessArgs, hfx::AbstractMatrix; steps=-1, retu
         while cur <= size(hfx, 1)
             corr = args.cor_func((@view hfx[ind, :]), (@view hfx[cur, :]))
 
-            if ismissing(corr) || corr >= corr_thres
+            if isnan(corr) || corr >= corr_thres
                 cur += 1
                 continue
             end
@@ -56,6 +58,7 @@ function _corr_downsample_rev(args::ProcessArgs, hfx::AbstractMatrix; steps=-1, 
         corr_thres = args.corr_thres
     end
 
+    hfx = coalesce.(hfx, NaN)
     ind = size(hfx, 1) - args.shift
 
     if ind <= 1
@@ -70,7 +73,7 @@ function _corr_downsample_rev(args::ProcessArgs, hfx::AbstractMatrix; steps=-1, 
         while cur >= 1
             corr = args.cor_func((@view hfx[ind, :]), (@view hfx[cur, :]))
 
-            if ismissing(corr) || corr >= corr_thres
+            if isnan(corr) || corr >= corr_thres
                 cur -= 1
                 continue
             end
@@ -286,7 +289,7 @@ function _corr_downsample_rev_impl(args::ProcessArgs, roll::Bool)
     df_buffer = args.dfs_buffer[args.task.symbol]
     bdays = (date - df_buffer[1, :Date]).value
     if bdays > dmax
-        @rsubset!(df_buffer, :Date >= date - Day(dmax))
+        filter!(:Date => >=(date - Day(dmax)), df_buffer)
     end
 
     return df_subset
@@ -391,7 +394,7 @@ function corr_label(args::ProcessArgs)
     df_selected = args.stock_info[args.task.symbol]
 
     if df_selected[1, :Timestamp] < df_buffer[1, :Timestamp]
-        @rsubset!(df_selected, :Timestamp >= df_buffer.Timestamp[1])
+        filter!(:Timestamp => >=(df_buffer.Timestamp[1]), df_selected)
     end
 
     if isempty(df_selected)

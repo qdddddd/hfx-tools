@@ -7,17 +7,18 @@ struct ProcessTask
     symbol::AbstractString
     idir::AbstractString
     status::Atomic{UInt8}
-    ProcessTask(dtid::Int, symbol::AbstractString, idir::AbstractString, status::UInt8) = new(dtid, symbol, idir, Atomic{UInt8}(status))
-    ProcessTask(signal::AbstractString, status::UInt8) = new(0, signal, "", Atomic{UInt8}(status))
 end
+
+ProcessTask(dtid::Int, symbol::AbstractString, idir::AbstractString, status::UInt8) = ProcessTask(dtid, symbol, idir, Atomic{UInt8}(status))
+ProcessTask(signal::AbstractString, status::UInt8) = ProcessTask(0, signal, "", Atomic{UInt8}(status))
 
 ## ProcessArgs
 struct ProcessArgs
     kwargs::Dict{Symbol,Any}
-    ProcessArgs() = new(Dict{Symbol,Any}())
-    ProcessArgs(; kwargs...) = new(Dict{Symbol,Any}(kwargs))
-    ProcessArgs(p::ProcessArgs; kwargs...) = new(Dict{Symbol,Any}(vcat(collect(getfield(p, :kwargs)), collect(kwargs))))
 end
+
+ProcessArgs(; kwargs...) = ProcessArgs(Dict{Symbol,Any}(kwargs))
+ProcessArgs(p::ProcessArgs; kwargs...) = ProcessArgs(Dict{Symbol,Any}(vcat(collect(getfield(p, :kwargs)), collect(kwargs))))
 
 import Base.getproperty, Base.setproperty!
 Base.getproperty(x::ProcessArgs, name::Symbol) = getfield(x, :kwargs)[name]
@@ -28,9 +29,9 @@ using DataStructures
 struct LockedDeque{T}
     lock::ReentrantLock
     q::Deque{T}
-
-    LockedDeque{T}() where {T} = new(ReentrantLock(), Deque{T}())
 end
+
+LockedDeque{T}() where {T} = LockedDeque(ReentrantLock(), Deque{T}())
 
 import Base.first, Base.last, Base.isempty, Base.empty!, Base.pop!, Base.popfirst!, Base.push!, Base.pushfirst!, Base.length
 first(q::LockedDeque) =
@@ -74,9 +75,9 @@ length(q::LockedDeque) =
 struct LockedDict{K,V}
     lock::ReadWriteLock
     d::Dict{K,V}
-
-    LockedDict{K,V}() where {K,V} = new(ReadWriteLock(), Dict{K,V}())
 end
+
+LockedDict{K,V}() where {K,V} = LockedDict(ReadWriteLock(), Dict{K,V}())
 
 import Base.getindex, Base.setindex!, Base.haskey, Base.keys, Base.delete!
 getindex(d::LockedDict{K,V}, k::K) where {K,V} =

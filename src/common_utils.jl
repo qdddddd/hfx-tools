@@ -1,12 +1,15 @@
-using Dates, DataFramesMeta
-using DfUtils
+using Dates, JlUtils
+using .DfUtils
 
 function get_date_symbol(fname::String)
     tup = split(split(fname, "/")[end], "_")
     (String(tup[2][1:8]), String(tup[1]))
 end
 
-get_in_file(args, dt) = joinpath(args.task.idir, dt, "$(args.task.symbol)_$(dt).csv.gz")
+function get_in_file(args, dt)
+    symbol = args.task.symbol == "302132.SZ" && dt <= "20250214" ? "300114.SZ" : args.task.symbol
+    joinpath(args.task.idir, dt, "$(symbol)_$(dt).csv.gz")
+end
 
 function get_out_file(args, dt)
     out_root = args.use_tmp ? args.out_root_tmp : args.out_root
